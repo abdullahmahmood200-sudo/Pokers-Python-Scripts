@@ -1,0 +1,397 @@
+import pandas as pd
+import os
+import sys
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+INPUT_FOLDER = r'D:\Monthly Reports'
+OUTPUT_FOLDER = r'D:\Monthly Reports\Merged Output'
+RAKEBACK_FILE = os.path.join(OUTPUT_FOLDER, 'Player rakebacks - Sheet1.csv')
+TARGET_SHEET = 'Member Statistics'
+
+# Output files
+MASTER_FILE = os.path.join(OUTPUT_FOLDER, 'Validated Poker Stats.xlsx')
+MASTER_WITH_PROFITS = os.path.join(OUTPUT_FOLDER, 'Validated_Poker_Stats_With_Profits.xlsx')
+REVENUE_RANKINGS = os.path.join(OUTPUT_FOLDER, 'Top_Performers_By_Revenue.xlsx')
+PROFIT_RANKINGS = os.path.join(OUTPUT_FOLDER, 'Top_Performers_By_Profit.xlsx')
+
+# ==========================================
+# RAKEBACK CALCULATOR CLASS
+# ==========================================
+class RakebackCalculator:
+    """Handles rakeback calculations with simplified Agent structure"""
+    
+    def __init__(self, rakeback_csv_path):
+        self.rakeback_df = pd.read_csv(rakeback_csv_path)
+        self.rakeback_df.columns = self.rakeback_df.columns.str.strip()
+        
+        if 'rb_pct.1' in self.rakeback_df.columns:
+            self.rakeback_df.rename(columns={'rb_pct.1': 'agent_rb_pct'}, inplace=True)
+        
+        self._build_lookups()
+        
+        print(f"   ✅ Loaded rakeback data: {len(self.player_rb)} players, {len(self.agent_rb)} agents")
+    
+    def _build_lookups(self):
+        self.player_rb = {}
+        for _, row in self.rakeback_df.iterrows():
+            if pd.notna(row['Player']) and pd.notna(row['rb_pct']):
+                player_name = str(row['Player']).strip().lower()
+                self.player_rb[player_name] = float(row['rb_pct'])
+        
+        self.agent_rb = {}
+        for _, row in self.rakeback_df.iterrows():
+            if pd.notna(row.get('Agent')) and pd.notna(row.get('agent_rb_pct')):
+                agent_name = str(row['Agent']).strip().lower()
+                self.agent_rb[agent_name] = float(row['agent_rb_pct'])
+    
+    def get_rakeback_pct(self, nickname, role, superagent_name, agent_name):
+        """
+        FIXED: Proper hierarchy with SuperAgent fallback when Agent not found
+        
+        Priority:
+        1. Direct player listing
+        2. Check if player's name is an agent (handles role changes)
+        3. Agent (if exists in rakeback)
+        4. SuperAgent (primary or fallback)
+        5. Default 25%
+        """
+        nickname_lower = str(nickname).strip().lower()
+        sa_name = None if pd.isna(superagent_name) or str(superagent_name).strip() == '-' else str(superagent_name).strip().lower()
+        ag_name = None if pd.isna(agent_name) or str(agent_name).strip() == '-' else str(agent_name).strip().lower()
+        
+        # PRIORITY 1: Direct player listing
+        if nickname_lower in self.player_rb:
+            return self.player_rb[nickname_lower]
+        
+        # PRIORITY 2: Check if nickname is actually an agent (handles role changes)
+        if nickname_lower in self.agent_rb:
+            return self.agent_rb[nickname_lower]
+        
+        # PRIORITY 3: Agent (only if found in rakeback data)
+        if ag_name:
+            if ag_name in self.agent_rb:
+                return self.agent_rb[ag_name]
+            if ag_name in self.player_rb:
+                return self.player_rb[ag_name]
+        
+        # PRIORITY 4: SuperAgent (primary or fallback when agent not found)
+        if sa_name:
+            if sa_name in self.agent_rb:
+                return self.agent_rb[sa_name]
+            if sa_name in self.player_rb:
+                return self.player_rb[sa_name]
+        
+        # PRIORITY 5: Default 25%
+        return 0.25
+    
+    def calculate_profit(self, rake, rakeback_pct):
+        return rake * (1 - rakeback_pct)
+    
+    def add_rakeback_to_dataframe(self, df):
+        df = df.copy()
+        
+        df['Rakeback_Pct'] = df.apply(
+            lambda row: self.get_rakeback_pct(
+                row['Nickname'], row['Role'],
+                row.get('SuperAgent_Name'), row.get('Agent_Name')
+            ), axis=1
+        )
+        
+        df['Net_Profit_Ring'] = self.calculate_profit(df['Rake_Ring_Total'], df['Rakeback_Pct'])
+        df['Net_Profit_MTT'] = self.calculate_profit(df['Rake_MTT_Total'], df['Rakeback_Pct'])
+        df['Net_Profit_Total'] = df['Net_Profit_Ring'] + df['Net_Profit_MTT']
+        
+        df['Rakeback_Paid_Ring'] = df['Rake_Ring_Total'] * df['Rakeback_Pct']
+        df['Rakeback_Paid_MTT'] = df['Rake_MTT_Total'] * df['Rakeback_Pct']
+        df['Rakeback_Paid_Total'] = df['Rakeback_Paid_Ring'] + df['Rakeback_Paid_MTT']
+        
+        return df
+
+
+# ==========================================
+# STEP 1: MERGE ALL WEEKLY FILES
+# ==========================================
+def merge_weekly_files():
+    print("=" * 80)
+    print("📊 STEP 1: MERGING WEEKLY FILES")
+    print("=" * 80)
+    
+    all_data = []
+    
+    if not os.path.exists(OUTPUT_FOLDER):
+        os.makedirs(OUTPUT_FOLDER)
+    
+    print(f"\n🔍 Scanning folder: {INPUT_FOLDER}")
+    
+    for filename in os.listdir(INPUT_FOLDER):
+        if filename.endswith('.xlsx') and not filename.startswith('~$'):
+            file_path = os.path.join(INPUT_FOLDER, filename)
+            
+            try:
+                df_raw = pd.read_excel(file_path, sheet_name=TARGET_SHEET, header=[3, 4, 5])
+                
+                # Helper functions
+                def find_column(level0, level1, level2):
+                    for idx, col in enumerate(df_raw.columns):
+                        if (str(level0).lower() in str(col[0]).lower() and
+                            str(level1).lower() in str(col[1]).lower() and
+                            str(level2).lower() in str(col[2]).lower()):
+                            return idx
+                    return None
+                
+                def get_column_safe(level0, level1, level2, default=0):
+                    idx = find_column(level0, level1, level2)
+                    return df_raw.iloc[:, idx] if idx is not None else pd.Series([default] * len(df_raw))
+                
+                # Extract all columns
+                superagent_id = df_raw.iloc[:, 2]
+                superagent_name = df_raw.iloc[:, 3]
+                agent_id = df_raw.iloc[:, 4]
+                agent_name = df_raw.iloc[:, 5]
+                member_id = df_raw.iloc[:, 8]
+                nickname = df_raw.iloc[:, 9]
+                country = df_raw.iloc[:, 6]
+                role = df_raw.iloc[:, 7]
+                
+                # P&L
+                pnl_ring_nlh = get_column_safe('Player P&L', 'Ring Game', 'NLH')
+                pnl_ring_plo = get_column_safe('Player P&L', 'Ring Game', 'PLO')
+                pnl_ring_plo5 = get_column_safe('Player P&L', 'Ring Game', 'PLO5')
+                pnl_ring_plo6 = get_column_safe('Player P&L', 'Ring Game', 'PLO6')
+                pnl_ring_plo_combined = pnl_ring_plo + pnl_ring_plo5 + pnl_ring_plo6
+                
+                pnl_total_idx = find_column('Player P&L', 'Total', '')
+                pnl_ring_total = df_raw.iloc[:, pnl_total_idx] if pnl_total_idx else pnl_ring_nlh + pnl_ring_plo_combined
+                
+                pnl_mtt_nlh = get_column_safe('Player P&L', 'MTT', 'NLH')
+                pnl_mtt_plo = get_column_safe('Player P&L', 'MTT', 'PLO')
+                pnl_mtt_plo5 = get_column_safe('Player P&L', 'MTT', 'PLO5')
+                pnl_mtt_plo6 = get_column_safe('Player P&L', 'MTT', 'PLO6')
+                pnl_mtt_plo_combined = pnl_mtt_plo + pnl_mtt_plo5 + pnl_mtt_plo6
+                pnl_mtt_total = df_raw.iloc[:, pnl_total_idx] if pnl_total_idx else pnl_mtt_nlh + pnl_mtt_plo_combined
+                
+                # Rake
+                rake_ring_nlh = get_column_safe('Rake&Fee', 'Ring Game', 'NLH')
+                rake_ring_plo = get_column_safe('Rake&Fee', 'Ring Game', 'PLO')
+                rake_ring_plo5 = get_column_safe('Rake&Fee', 'Ring Game', 'PLO5')
+                rake_ring_plo6 = get_column_safe('Rake&Fee', 'Ring Game', 'PLO6')
+                rake_ring_plo_combined = rake_ring_plo + rake_ring_plo5 + rake_ring_plo6
+                
+                rake_total_idx = find_column('Rake&Fee', 'Total', '')
+                rake_ring_total = df_raw.iloc[:, rake_total_idx] if rake_total_idx else rake_ring_nlh + rake_ring_plo_combined
+                
+                rake_mtt_nlh = get_column_safe('Rake&Fee', 'MTT', 'NLH')
+                rake_mtt_plo = get_column_safe('Rake&Fee', 'MTT', 'PLO')
+                rake_mtt_plo5 = get_column_safe('Rake&Fee', 'MTT', 'PLO5')
+                rake_mtt_plo6 = get_column_safe('Rake&Fee', 'MTT', 'PLO6')
+                rake_mtt_plo_combined = rake_mtt_plo + rake_mtt_plo5 + rake_mtt_plo6
+                rake_mtt_total = df_raw.iloc[:, rake_total_idx] if rake_total_idx else rake_mtt_nlh + rake_mtt_plo_combined
+                
+                # Hands
+                hands_ring_nlh = get_column_safe('Played Hands', 'Ring Game', 'NLH')
+                hands_ring_plo = get_column_safe('Played Hands', 'Ring Game', 'PLO')
+                hands_ring_plo5 = get_column_safe('Played Hands', 'Ring Game', 'PLO5')
+                hands_ring_plo6 = get_column_safe('Played Hands', 'Ring Game', 'PLO6')
+                hands_ring_plo_combined = hands_ring_plo + hands_ring_plo5 + hands_ring_plo6
+                
+                hands_total_idx = find_column('Played Hands', 'Total', '')
+                hands_ring_total = df_raw.iloc[:, hands_total_idx] if hands_total_idx else hands_ring_nlh + hands_ring_plo_combined
+                
+                hands_mtt_nlh = get_column_safe('Played Hands', 'MTT', 'NLH')
+                hands_mtt_plo = get_column_safe('Played Hands', 'MTT', 'PLO')
+                hands_mtt_plo5 = get_column_safe('Played Hands', 'MTT', 'PLO5')
+                hands_mtt_plo6 = get_column_safe('Played Hands', 'MTT', 'PLO6')
+                hands_mtt_plo_combined = hands_mtt_plo + hands_mtt_plo5 + hands_mtt_plo6
+                hands_mtt_total = df_raw.iloc[:, hands_total_idx] if hands_total_idx else hands_mtt_nlh + hands_mtt_plo_combined
+                
+                # Build dataframe
+                df_clean = pd.DataFrame({
+                    'Member_ID': member_id, 'Nickname': nickname, 'Country': country, 'Role': role,
+                    'SuperAgent_ID': superagent_id, 'SuperAgent_Name': superagent_name,
+                    'Agent_ID': agent_id, 'Agent_Name': agent_name,
+                    'PnL_Ring_NLH': pnl_ring_nlh, 'PnL_Ring_PLO_Combined': pnl_ring_plo_combined,
+                    'PnL_Ring_Total': pnl_ring_total, 'PnL_MTT_NLH': pnl_mtt_nlh,
+                    'PnL_MTT_PLO_Combined': pnl_mtt_plo_combined, 'PnL_MTT_Total': pnl_mtt_total,
+                    'Rake_Ring_NLH': rake_ring_nlh, 'Rake_Ring_PLO_Combined': rake_ring_plo_combined,
+                    'Rake_Ring_Total': rake_ring_total, 'Rake_MTT_NLH': rake_mtt_nlh,
+                    'Rake_MTT_PLO_Combined': rake_mtt_plo_combined, 'Rake_MTT_Total': rake_mtt_total,
+                    'Hands_Ring_NLH': hands_ring_nlh, 'Hands_Ring_PLO_Combined': hands_ring_plo_combined,
+                    'Hands_Ring_Total': hands_ring_total, 'Hands_MTT_NLH': hands_mtt_nlh,
+                    'Hands_MTT_PLO_Combined': hands_mtt_plo_combined, 'Hands_MTT_Total': hands_mtt_total,
+                    'Source_File': filename
+                })
+                
+                df_clean = df_clean[df_clean['Nickname'].notna()]
+                df_clean = df_clean[df_clean['Nickname'].astype(str).str.upper() != 'TOTAL']
+                df_clean = df_clean.dropna(how='all', subset=df_clean.columns[:-1])
+                
+                all_data.append(df_clean)
+                print(f"   ✅ {filename}: {len(df_clean)} rows")
+                
+            except Exception as e:
+                print(f"   ❌ {filename}: {e}")
+    
+    if all_data:
+        combined_df = pd.concat(all_data, ignore_index=True)
+        
+        # DUPLICATE REMOVAL
+        initial_count = len(combined_df)
+        combined_df = combined_df.drop_duplicates(subset=['Member_ID', 'Source_File'], keep='first')
+        duplicates_removed = initial_count - len(combined_df)
+        
+        if duplicates_removed > 0:
+            print(f"\n⚠️  Removed {duplicates_removed} duplicate rows (same player in same file)")
+        
+        combined_df.to_excel(MASTER_FILE, index=False)
+        print(f"\n✅ Merged {len(combined_df)} rows → {MASTER_FILE}")
+        return combined_df
+    else:
+        print("\n❌ No data found!")
+        return None
+
+
+# ==========================================
+# STEP 2: CALCULATE PROFITS & SAVE
+# ==========================================
+def calculate_and_save_profits(df):
+    print("\n" + "=" * 80)
+    print("💰 STEP 2: CALCULATING PROFITS")
+    print("=" * 80)
+    
+    calc = RakebackCalculator(RAKEBACK_FILE)
+    df_with_profits = calc.add_rakeback_to_dataframe(df)
+    
+    df_with_profits.to_excel(MASTER_WITH_PROFITS, index=False)
+    print(f"\n💾 Saved with profits → {MASTER_WITH_PROFITS}")
+    
+    return df_with_profits
+
+
+# ==========================================
+# STEP 3: GENERATE RANKINGS
+# ==========================================
+def generate_rankings(df):
+    print("\n" + "=" * 80)
+    print("🏆 STEP 3: GENERATING RANKINGS")
+    print("=" * 80)
+    
+    # Aggregate by player
+    player_stats = df.groupby('Member_ID').agg({
+        'Nickname': 'first', 'Country': 'first', 'Role': 'first',
+        'SuperAgent_Name': 'first', 'Agent_Name': 'first', 'Rakeback_Pct': 'first',
+        'Rake_Ring_NLH': 'sum', 'Rake_Ring_PLO_Combined': 'sum', 'Rake_Ring_Total': 'sum',
+        'Rake_MTT_NLH': 'sum', 'Rake_MTT_PLO_Combined': 'sum', 'Rake_MTT_Total': 'sum',
+        'Net_Profit_Ring': 'sum', 'Net_Profit_MTT': 'sum', 'Net_Profit_Total': 'sum',
+        'Rakeback_Paid_Ring': 'sum', 'Rakeback_Paid_MTT': 'sum', 'Rakeback_Paid_Total': 'sum',
+        'Hands_Ring_Total': 'sum', 'Hands_MTT_Total': 'sum',
+        'Source_File': 'count'
+    }).reset_index()
+    
+    player_stats.rename(columns={'Source_File': 'Weeks_Active'}, inplace=True)
+    player_stats['Total_Revenue'] = player_stats['Rake_Ring_Total'] + player_stats['Rake_MTT_Total']
+    player_stats['Total_Hands'] = player_stats['Hands_Ring_Total'] + player_stats['Hands_MTT_Total']
+    player_stats['Revenue_Per_Hand'] = (player_stats['Total_Revenue'] / player_stats['Total_Hands']).fillna(0)
+    player_stats['Profit_Per_Hand'] = (player_stats['Net_Profit_Total'] / player_stats['Total_Hands']).fillna(0)
+    
+    print(f"\n   📊 {len(player_stats)} unique players")
+    print(f"   💵 Total Revenue: ${player_stats['Total_Revenue'].sum():,.2f}")
+    print(f"   💰 Total Profit: ${player_stats['Net_Profit_Total'].sum():,.2f}")
+    
+    # Revenue rankings
+    revenue_ranked = player_stats.sort_values('Total_Revenue', ascending=False).reset_index(drop=True)
+    revenue_ranked['Rank'] = range(1, len(revenue_ranked) + 1)
+    revenue_ranked['Percentile'] = ((revenue_ranked['Rank'] / len(revenue_ranked)) * 100).round(2)
+    save_ranking_file(revenue_ranked, 'REVENUE', REVENUE_RANKINGS)
+    
+    # Profit rankings
+    profit_ranked = player_stats.sort_values('Net_Profit_Total', ascending=False).reset_index(drop=True)
+    profit_ranked['Rank'] = range(1, len(profit_ranked) + 1)
+    profit_ranked['Percentile'] = ((profit_ranked['Rank'] / len(profit_ranked)) * 100).round(2)
+    save_ranking_file(profit_ranked, 'PROFIT', PROFIT_RANKINGS)
+
+
+def save_ranking_file(ranked_df, ranking_type, output_path):
+    print(f"\n   📝 Creating {ranking_type} rankings...")
+    
+    total_players = len(ranked_df)
+    top_5 = ranked_df.head(max(1, int(total_players * 0.05))).copy()
+    top_10 = ranked_df.head(max(1, int(total_players * 0.10))).copy()
+    top_20 = ranked_df.head(max(1, int(total_players * 0.20))).copy()
+    bottom_50 = ranked_df.tail(max(1, int(total_players * 0.50))).copy()
+    
+    top_5['Segment'] = 'Top 5%'
+    top_10['Segment'] = 'Top 10%'
+    top_20['Segment'] = 'Top 20%'
+    bottom_50['Segment'] = 'Bottom 50%'
+    
+    def calc_stats(segment_df, segment_name):
+        return {
+            'Segment': segment_name, 'Player_Count': len(segment_df),
+            'Total_Revenue': segment_df['Total_Revenue'].sum(),
+            'Total_Profit': segment_df['Net_Profit_Total'].sum(),
+            'Total_Rakeback_Paid': segment_df['Rakeback_Paid_Total'].sum(),
+            'Avg_Revenue': segment_df['Total_Revenue'].mean(),
+            'Avg_Profit': segment_df['Net_Profit_Total'].mean(),
+            'Avg_Rakeback_Pct': segment_df['Rakeback_Pct'].mean(),
+            'Total_Hands': segment_df['Total_Hands'].sum(),
+            'Avg_Weeks_Active': segment_df['Weeks_Active'].mean(),
+            'Pct_of_Total_Revenue': (segment_df['Total_Revenue'].sum() / ranked_df['Total_Revenue'].sum() * 100),
+            'Pct_of_Total_Profit': (segment_df['Net_Profit_Total'].sum() / ranked_df['Net_Profit_Total'].sum() * 100)
+        }
+    
+    segment_stats = pd.DataFrame([
+        calc_stats(top_5, 'Top 5%'), calc_stats(top_10, 'Top 10%'),
+        calc_stats(top_20, 'Top 20%'), calc_stats(bottom_50, 'Bottom 50%')
+    ])
+    
+    output_columns = [
+        'Rank', 'Member_ID', 'Nickname', 'Country', 'Role',
+        'SuperAgent_Name', 'Agent_Name', 'Rakeback_Pct',
+        'Total_Revenue', 'Net_Profit_Total', 'Rakeback_Paid_Total',
+        'Rake_Ring_Total', 'Rake_MTT_Total', 'Net_Profit_Ring', 'Net_Profit_MTT',
+        'Total_Hands', 'Hands_Ring_Total', 'Hands_MTT_Total',
+        'Weeks_Active', 'Revenue_Per_Hand', 'Profit_Per_Hand',
+        'Percentile', 'Segment'
+    ]
+    
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        segment_stats.to_excel(writer, sheet_name='Overview', index=False)
+        top_5[output_columns].to_excel(writer, sheet_name='Top 5%', index=False)
+        top_10[output_columns].to_excel(writer, sheet_name='Top 10%', index=False)
+        top_20[output_columns].to_excel(writer, sheet_name='Top 20%', index=False)
+        bottom_50[output_columns].to_excel(writer, sheet_name='Bottom 50%', index=False)
+        ranked_df[output_columns[:-1]].to_excel(writer, sheet_name='All Players', index=False)
+        ranked_df.head(10)[output_columns[:-1]].to_excel(writer, sheet_name='Top 10 Stars', index=False)
+    
+    print(f"   ✅ Saved → {output_path}")
+
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+def main():
+    print("\n" + "=" * 80)
+    print("🚀 POKER STATS ANALYZER - COMPLETE PIPELINE")
+    print("=" * 80)
+    
+    # Step 1: Merge
+    df_merged = merge_weekly_files()
+    if df_merged is None:
+        return
+    
+    # Step 2: Calculate profits
+    df_with_profits = calculate_and_save_profits(df_merged)
+    
+    # Step 3: Generate rankings
+    generate_rankings(df_with_profits)
+    
+    print("\n" + "=" * 80)
+    print("✨ COMPLETE! All files saved to:")
+    print(f"   📁 {OUTPUT_FOLDER}")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
